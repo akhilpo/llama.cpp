@@ -1371,6 +1371,28 @@ extern "C" {
     LLAMA_API void llama_memory_breakdown_print(const struct llama_context * ctx);
 
     //
+    // MoE expert logging (for GPT-OSS and other MoE architectures)
+    //
+
+    // Enable or disable MoE expert logging
+    // When enabled, logs which experts are selected for each token during inference
+    // NOTE: Only works with CPU backend for now
+    LLAMA_API void llama_moe_expert_logging_enable(struct llama_context * ctx, bool enable);
+
+    // Check if MoE expert logging is enabled
+    LLAMA_API bool llama_moe_expert_logging_is_enabled(const struct llama_context * ctx);
+
+    // Clear the MoE expert log
+    LLAMA_API void llama_moe_expert_logging_clear(struct llama_context * ctx);
+
+    // Print MoE expert selection statistics including:
+    // - Total tokens and layers processed
+    // - Expert usage counts
+    // - Consecutive expert usage patterns
+    // - Detailed expert selections per token
+    LLAMA_API void llama_moe_expert_logging_print_stats(const struct llama_context * ctx);
+
+    //
     // training
     //
 

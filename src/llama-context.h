@@ -181,6 +181,30 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
 
+    //
+    // MoE expert logging
+    //
+
+    void moe_expert_logging_enable(bool enable);
+    bool moe_expert_logging_is_enabled() const;
+    void moe_expert_logging_clear();
+
+    struct moe_expert_stats {
+        int32_t total_tokens = 0;
+        int32_t total_layers = 0;
+        std::map<int32_t, int32_t> expert_usage_count;  // expert_id -> count
+        std::map<int32_t, int32_t> consecutive_usage;    // consecutive_count -> occurrences
+    };
+
+    moe_expert_stats moe_expert_logging_get_stats() const;
+    void moe_expert_logging_print_stats() const;
+
+    // Internal method to log expert selections
+    void moe_log_expert_selection(int32_t layer, int32_t token_idx, const std::vector<int32_t> & expert_ids);
+
+    // Internal method to process MoE tensors after graph execution
+    void moe_process_expert_tensors();
+
 private:
     //
     // output
@@ -309,4 +333,24 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // MoE expert logging
+    bool moe_expert_logging_enabled = false;
+
+    struct moe_expert_selection {
+        int32_t layer;
+        int32_t token_idx;
+        std::vector<int32_t> expert_ids;  // selected expert indices
+    };
+
+    std::vector<moe_expert_selection> moe_expert_log;
+
+    struct moe_expert_tensor {
+        ggml_tensor * tensor;
+        int32_t layer;
+        int32_t n_tokens;
+        int32_t n_expert_used;
+    };
+
+    mutable std::vector<moe_expert_tensor> moe_expert_tensors_current;
 };

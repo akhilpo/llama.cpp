@@ -793,6 +793,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // Process MoE expert tensors if logging is enabled
+    moe_process_expert_tensors();
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -1478,6 +1481,21 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // Capture MoE expert selection tensors for logging
+        if (moe_expert_logging_enabled && strcmp(name, "ffn_moe_topk") == 0 && il >= 0) {
+            // The tensor shape is [n_expert_used, n_tokens]
+            const int32_t n_expert_used = cur->ne[0];
+            const int32_t n_tokens = cur->ne[1];
+
+            moe_expert_tensor tensor_info;
+            tensor_info.tensor = cur;
+            tensor_info.layer = il;
+            tensor_info.n_tokens = n_tokens;
+            tensor_info.n_expert_used = n_expert_used;
+
+            moe_expert_tensors_current.push_back(tensor_info);
         }
 
         if (!cparams.offload_kqv) {
@@ -2929,6 +2947,26 @@ void llama_memory_breakdown_print(const struct llama_context * ctx) {
 }
 
 //
+// MoE expert logging
+//
+
+void llama_moe_expert_logging_enable(llama_context * ctx, bool enable) {
+    ctx->moe_expert_logging_enable(enable);
+}
+
+bool llama_moe_expert_logging_is_enabled(const llama_context * ctx) {
+    return ctx->moe_expert_logging_is_enabled();
+}
+
+void llama_moe_expert_logging_clear(llama_context * ctx) {
+    ctx->moe_expert_logging_clear();
+}
+
+void llama_moe_expert_logging_print_stats(const llama_context * ctx) {
+    ctx->moe_expert_logging_print_stats();
+}
+
+//
 // training
 //
 
@@ -2957,4 +2995,186 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+//
+// MoE expert logging
+//
+
+void llama_context::moe_expert_logging_enable(bool enable) {
+    moe_expert_logging_enabled = enable;
+    if (enable) {
+        moe_expert_log.clear();
+    }
+}
+
+bool llama_context::moe_expert_logging_is_enabled() const {
+    return moe_expert_logging_enabled;
+}
+
+void llama_context::moe_expert_logging_clear() {
+    moe_expert_log.clear();
+}
+
+void llama_context::moe_log_expert_selection(int32_t layer, int32_t token_idx, const std::vector<int32_t> & expert_ids) {
+    if (!moe_expert_logging_enabled) {
+        return;
+    }
+
+    moe_expert_selection selection;
+    selection.layer = layer;
+    selection.token_idx = token_idx;
+    selection.expert_ids = expert_ids;
+    moe_expert_log.push_back(selection);
+}
+
+llama_context::moe_expert_stats llama_context::moe_expert_logging_get_stats() const {
+    moe_expert_stats stats;
+
+    if (moe_expert_log.empty()) {
+        return stats;
+    }
+
+    // Count total tokens and layers
+    std::set<int32_t> unique_tokens;
+    std::set<int32_t> unique_layers;
+
+    for (const auto & entry : moe_expert_log) {
+        unique_tokens.insert(entry.token_idx);
+        unique_layers.insert(entry.layer);
+
+        // Count expert usage
+        for (int32_t expert_id : entry.expert_ids) {
+            stats.expert_usage_count[expert_id]++;
+        }
+    }
+
+    stats.total_tokens = unique_tokens.size();
+    stats.total_layers = unique_layers.size();
+
+    // Calculate consecutive expert usage statistics
+    // Group by layer and token to analyze consecutive patterns
+    std::map<int32_t, std::vector<std::set<int32_t>>> layer_experts; // layer -> [token_idx -> {expert_ids}]
+
+    for (const auto & entry : moe_expert_log) {
+        if (layer_experts[entry.layer].size() <= static_cast<size_t>(entry.token_idx)) {
+            layer_experts[entry.layer].resize(entry.token_idx + 1);
+        }
+        layer_experts[entry.layer][entry.token_idx] = std::set<int32_t>(entry.expert_ids.begin(), entry.expert_ids.end());
+    }
+
+    // For each layer, analyze consecutive expert usage across tokens
+    for (const auto & layer_pair : layer_experts) {
+        const auto & token_experts = layer_pair.second;
+
+        if (token_experts.size() < 2) {
+            continue;
+        }
+
+        for (size_t i = 0; i < token_experts.size() - 1; i++) {
+            const auto & current_experts = token_experts[i];
+            const auto & next_experts = token_experts[i + 1];
+
+            if (current_experts.empty() || next_experts.empty()) {
+                continue;
+            }
+
+            // Count how many experts appear in both consecutive tokens
+            int32_t consecutive_count = 0;
+            for (int32_t expert : current_experts) {
+                if (next_experts.find(expert) != next_experts.end()) {
+                    consecutive_count++;
+                }
+            }
+
+            if (consecutive_count > 0) {
+                stats.consecutive_usage[consecutive_count]++;
+            }
+        }
+    }
+
+    return stats;
+}
+
+void llama_context::moe_expert_logging_print_stats() const {
+    auto stats = moe_expert_logging_get_stats();
+
+    LLAMA_LOG_INFO("\n");
+    LLAMA_LOG_INFO("=== MoE Expert Selection Statistics ===\n");
+    LLAMA_LOG_INFO("Total tokens processed: %d\n", stats.total_tokens);
+    LLAMA_LOG_INFO("Total layers with MoE: %d\n", stats.total_layers);
+    LLAMA_LOG_INFO("\n");
+
+    if (!stats.expert_usage_count.empty()) {
+        LLAMA_LOG_INFO("Expert Usage Count:\n");
+        for (const auto & pair : stats.expert_usage_count) {
+            LLAMA_LOG_INFO("  Expert %d: %d times\n", pair.first, pair.second);
+        }
+        LLAMA_LOG_INFO("\n");
+    }
+
+    if (!stats.consecutive_usage.empty()) {
+        LLAMA_LOG_INFO("Consecutive Expert Usage (across consecutive tokens):\n");
+        int32_t total_consecutive = 0;
+        for (const auto & pair : stats.consecutive_usage) {
+            LLAMA_LOG_INFO("  %d expert(s) used consecutively: %d occurrences\n", pair.first, pair.second);
+            total_consecutive += pair.second;
+        }
+        LLAMA_LOG_INFO("  Total consecutive patterns: %d\n", total_consecutive);
+        LLAMA_LOG_INFO("\n");
+    }
+
+    LLAMA_LOG_INFO("Detailed Expert Selections:\n");
+    for (const auto & entry : moe_expert_log) {
+        LLAMA_LOG_INFO("  Layer %2d, Token %3d: Experts [", entry.layer, entry.token_idx);
+        for (size_t i = 0; i < entry.expert_ids.size(); i++) {
+            LLAMA_LOG_INFO("%d", entry.expert_ids[i]);
+            if (i < entry.expert_ids.size() - 1) {
+                LLAMA_LOG_INFO(", ");
+            }
+        }
+        LLAMA_LOG_INFO("]\n");
+    }
+    LLAMA_LOG_INFO("=======================================\n");
+    LLAMA_LOG_INFO("\n");
+}
+
+void llama_context::moe_process_expert_tensors() {
+    if (!moe_expert_logging_enabled || moe_expert_tensors_current.empty()) {
+        return;
+    }
+
+    // Synchronize to ensure all computations are complete
+    synchronize();
+
+    // Process each captured expert tensor
+    for (const auto & expert_tensor_info : moe_expert_tensors_current) {
+        ggml_tensor * tensor = expert_tensor_info.tensor;
+        int32_t layer = expert_tensor_info.layer;
+        int32_t n_tokens = expert_tensor_info.n_tokens;
+        int32_t n_expert_used = expert_tensor_info.n_expert_used;
+
+        if (tensor == nullptr || tensor->type != GGML_TYPE_I32) {
+            continue;
+        }
+
+        // Allocate buffer to read tensor data
+        std::vector<int32_t> expert_ids(n_expert_used * n_tokens);
+
+        // Read tensor data from backend
+        ggml_backend_tensor_get(tensor, expert_ids.data(), 0, expert_ids.size() * sizeof(int32_t));
+
+        // Log expert selections for each token
+        for (int32_t token_idx = 0; token_idx < n_tokens; token_idx++) {
+            std::vector<int32_t> token_experts(n_expert_used);
+            for (int32_t i = 0; i < n_expert_used; i++) {
+                token_experts[i] = expert_ids[i * n_tokens + token_idx];
+            }
+
+            moe_log_expert_selection(layer, token_idx, token_experts);
+        }
+    }
+
+    // Clear the tensor list for the next batch
+    moe_expert_tensors_current.clear();
 }
