@@ -226,3 +226,15 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+# MoE expert logging test
+add_executable(test-moe-expert-logging test-moe-expert-logging.cpp)
+target_link_libraries(test-moe-expert-logging PRIVATE llama common)
+target_include_directories(test-moe-expert-logging PRIVATE ${PROJECT_SOURCE_DIR}/src)
+install(TARGETS test-moe-expert-logging RUNTIME)
+
+# MoE expert logging demonstration
+add_executable(test-moe-expert-logging-demo test-moe-expert-logging-demo.cpp)
+target_link_libraries(test-moe-expert-logging-demo PRIVATE llama common)
+target_include_directories(test-moe-expert-logging-demo PRIVATE ${PROJECT_SOURCE_DIR}/src)
+install(TARGETS test-moe-expert-logging-demo RUNTIME)
